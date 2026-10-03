@@ -27,7 +27,12 @@
 #                          human the wait is on. Only when neither absorb class
 #                          applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
+#                          both surfaced at once. A terminal status surfaces once
+#                          per declaration (its status line and latest completed
+#                          turn), so a finished pane that churns only through a
+#                          statusline clock stays quiet until a busy verdict, a
+#                          provably-working override, or a new declaration
+#                          re-arms it. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
 #                          consecutive escalations on the SAME pane, the reason
@@ -313,11 +318,11 @@ window_label() {
 # The ONE derivation of a window's per-window marker key: `:`, `/` and `.` become
 # `_` so a window name is usable as a filename suffix. Every per-window file the
 # watcher keeps is named by it (.hash-, .count-, .stale-, .stale-since-,
-# .wedge-escalations-, .paused-*, .writing-*), and live homes hold those markers on
-# disk under the current format, so the format lives here alone: a second copy is
-# how a future change to it silently orphans a window's markers instead of clearing
-# them. The helpers below take the derived key rather than re-deriving it, so one
-# poll of one window derives it once.
+# .stale-terminal-, .wedge-escalations-, .paused-*, .writing-*), and live homes
+# hold those markers on disk under the current format, so the format lives here
+# alone: a second copy is how a future change to it silently orphans a window's
+# markers instead of clearing them. The helpers below take the derived key rather
+# than re-deriving it, so one poll of one window derives it once.
 window_key() {  # <window>
   local key=${1//:/_}
   key=${key//\//_}
@@ -981,6 +986,24 @@ pause_state_class() {  # <window> <task>
     *) rm -f "$recheck_file" ;;
   esac
   printf '%s' "$class"
+}
+
+# The declaration a terminal-status stale (done, needs-decision, blocked, failed)
+# is surfaced once for: the task's status-log signature plus its latest completed
+# turn. The one-shot is keyed on this, never on the pane hash, because a finished
+# idle pane still churns its hash (a statusline clock, a token counter) while
+# nothing has changed for the supervisor, and a hash-keyed one-shot re-alarmed
+# firstmate on every tick for as long as the finished worker stayed alive. A new
+# status line or a newly completed turn is a new declaration and surfaces again,
+# and positive activity evidence (a busy verdict or a provably-working override)
+# drops the recorded declaration, so a worker that resumes and goes quiet again on
+# the same leftover line is still surfaced. The terminal branch of the stale
+# backbone records it in .stale-terminal-<key> only on a wake that really fires.
+terminal_stale_declaration() {  # <task>
+  local task=$1
+  printf 'terminal:%s:%s:%s' "$task" \
+    "$(fm_wake_signal_sig "$STATE/$task.status" || true)" \
+    "$(fm_wake_signal_sig "$STATE/$task.turn-ended" || true)"
 }
 
 # Surface a stale pane no classifier could resolve, so firstmate inspects it: it
@@ -1836,6 +1859,7 @@ EOF
     ssf="$STATE/.stale-since-$key"
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
+    tsf="$STATE/.stale-terminal-$key"   # terminal declaration already surfaced (terminal_stale_declaration)
     prev=$(cat "$hf" 2>/dev/null || true)
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
@@ -1843,6 +1867,8 @@ EOF
     # content cannot suppress stale detection. Read once per window per poll and
     # reused below so a busy verdict is consistent within one cycle.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
+    # A busy verdict is activity, so it re-arms a surfaced terminal declaration.
+    [ "$busy_now" -ne 0 ] || rm -f "$tsf"
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
@@ -1876,15 +1902,25 @@ EOF
           # line. On a NEW hash, give an active run/busy pane (the same
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
+          # Otherwise the terminal status surfaces once per declaration
+          # (terminal_stale_declaration), never again for a new hash alone.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            terminal_decl=$(terminal_stale_declaration "$task")
+            if crew_is_provably_working "$task"; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
+              rm -f "$tsf"
               clear_write_tracking "$key"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+            elif [ "$(cat "$tsf" 2>/dev/null || true)" = "$terminal_decl" ]; then
+              printf '%s' "$h" > "$sf"
+              rm -f "$ssf"
+              clear_write_tracking "$key"
+              triage_log "absorbed stale (terminal status already surfaced, pane changed without activity): $w"
             else
               fm_wake_append stale "$w" "stale: $w" || exit 1
               printf '%s' "$h" > "$sf"
+              printf '%s' "$terminal_decl" > "$tsf"
               rm -f "$ssf"
               clear_write_tracking "$key"
               stale_status="$STATE/$(window_to_task "$w" "$STATE").status"

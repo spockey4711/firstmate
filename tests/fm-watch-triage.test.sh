@@ -2124,11 +2124,12 @@ test_absorbed_replacement_wait_does_not_inherit_the_old_throttle() {
 # <mode> `exit` requires the watcher to surface and exit; `absorb` requires it to
 # survive whole poll cycles - enough to see the new hash, count it stable, and
 # reach the stale path. Returns 1 when the watcher does the other thing.
-parked_watch_round() {  # <state> <fakebin> <out> <capture> <window> <exit|absorb>
+parked_watch_round() {  # <state> <fakebin> <out> <capture> <window> <exit|absorb> [crew-state]
   local state=$1 fakebin=$2 out=$3 capture=$4 window=$5 mode=$6 pid cycles=0
+  local crew_state=${7:-'state: paused · source: status-log · parked'}
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture" \
     FM_FAKE_TMUX_CURRENT_COMMAND=grok \
-    FM_FAKE_CREW_STATE='state: paused · source: status-log · parked' \
+    FM_FAKE_CREW_STATE="$crew_state" \
     FM_WATCH_HANDLING_SUCCESSOR=1 \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -2244,6 +2245,95 @@ test_live_declared_wait_churn_honors_the_resurface_throttle() {
     [ "$bare" -eq 1 ] || fail "[$name] elapsed re-surface changed the wake identity: $(cat "$state/.wake-queue")"
   done
   pass "a parked live worker surfaces once, absorbs pane churn for the whole re-surface window, then re-surfaces when it elapses"
+}
+
+# --- a finished worker's pane churn must not re-surface its terminal status ---
+# The 2026-09 churn: workers whose last status was done (waiting on a merge) or
+# needs-decision (waiting on the captain) woke firstmate with a stale wake every
+# 60-120 s for as long as they stayed alive, because the terminal-status stale
+# was one-shot per pane HASH and the only thing still changing on their panes
+# was a statusline clock, and an exited agent's switch to a shell prompt added
+# one more. The contract pinned here: first sight surfaces once, pane churn or
+# an exited agent alone never repeats it, and each real change - a completed
+# turn, a busy verdict, or a new status line - surfaces the next quiet pane
+# again, on the same plain wake identity.
+test_terminal_stale_pane_churn_surfaces_once_per_declaration() {
+  local spec name status_line dir state fakebin out capture_file statusf window key
+  local sig minute crew wakes bare
+  crew='state: done · source: status-log · finished'
+  for spec in \
+    'done-churn|done: PR https://example.test/pr/9' \
+    'needs-decision-churn|needs-decision [key=route]: pick the routing option'
+  do
+    name=${spec%%|*}; status_line=${spec#*|}
+    dir=$(make_case "$name"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/finished.status"
+    window="test:fm-finished"
+    printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/finished.meta"
+    printf '%s\n' "$status_line" > "$statusf"
+    sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-finished_status"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+
+    printf 'finished · 10:01' > "$capture_file"
+    printf '%s' "$(hash_text 'finished · 10:01')" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit "$crew" \
+      || fail "[$name] first sight of a finished worker's stale pane did not surface"
+    ack_stopped_cycle "$state" || fail "[$name] could not acknowledge the first surface"
+
+    # Only the statusline clock moves, each round handled as a real supervision
+    # turn would. Every one of these used to wake firstmate.
+    for minute in 02 03 04; do
+      printf 'finished · 10:%s' "$minute" > "$capture_file"
+      parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" absorb "$crew" \
+        || fail "[$name] clock-only pane churn at 10:$minute re-surfaced the unchanged terminal status"
+      wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
+        "$state/.wake-queue" 2>/dev/null || echo 0)
+      [ "$wakes" -eq 0 ] || fail "[$name] clock-only pane churn queued $wakes stale wake(s)"
+    done
+
+    # The agent is exited and leaves a plain shell prompt. Its session-end hook
+    # completes no turn, so this is still the same finished declaration.
+    printf 'Resume this session with: claude --resume\nuser@host proj %% ' > "$capture_file"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" absorb "$crew" \
+      || fail "[$name] an exited agent's shell prompt re-surfaced the unchanged terminal status"
+    wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
+      "$state/.wake-queue" 2>/dev/null || echo 0)
+    [ "$wakes" -eq 0 ] || fail "[$name] an exited agent's shell prompt queued $wakes stale wake(s)"
+
+    # Each real change surfaces the next quiet pane exactly once: a completed
+    # turn, then a busy verdict with no turn record, then a new status line.
+    printf 'turn\n' > "$state/finished.turn-ended"
+    prime_turnend_seen "$state/finished.turn-ended"
+    printf 'finished · 10:05' > "$capture_file"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit "$crew" \
+      || fail "[$name] a quiet pane after a newly completed turn did not surface"
+    ack_stopped_cycle "$state" || fail "[$name] could not acknowledge the completed-turn surface"
+    printf 'finished · 10:06' > "$capture_file"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" absorb "$crew" \
+      || fail "[$name] clock-only churn after the completed-turn surface re-surfaced it"
+
+    printf 'working · Ctrl+c:cancel' > "$capture_file"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" absorb "$crew" \
+      || fail "[$name] a busy pane surfaced instead of being absorbed"
+    printf 'finished · 10:07' > "$capture_file"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit "$crew" \
+      || fail "[$name] a quiet pane after a busy verdict did not surface"
+    ack_stopped_cycle "$state" || fail "[$name] could not acknowledge the post-busy surface"
+
+    printf '%s\n' "$status_line" >> "$statusf"
+    sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-finished_status"
+    printf 'finished · 10:08' > "$capture_file"
+    parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit "$crew" \
+      || fail "[$name] a quiet pane after a new terminal status line did not surface"
+    wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
+      "$state/.wake-queue" 2>/dev/null || echo 0)
+    bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' \
+      "$state/.wake-queue" 2>/dev/null || echo 0)
+    [ "$wakes" -eq 1 ] || fail "[$name] a new terminal status line produced $wakes stale wakes instead of one"
+    [ "$bare" -eq 1 ] || fail "[$name] the re-surface changed the wake identity: $(cat "$state/.wake-queue")"
+  done
+  pass "a finished worker's terminal status surfaces once per declaration, and statusline churn or an exited agent alone never repeats it"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -4056,6 +4146,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_absorbed_replacement_wait_does_not_inherit_the_old_throttle
 test_live_declared_wait_churn_honors_the_resurface_throttle
+test_terminal_stale_pane_churn_surfaces_once_per_declaration
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_captain_held_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
